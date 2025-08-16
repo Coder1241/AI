@@ -1,57 +1,53 @@
-"""FastAPI application that exposes a retrieval-augmented chatbot.
-
-This module wires together a local Ollama model with a FAISS vector store so
-that questions sent to the ``/chat`` endpoint are answered using both the model
-and the documents found in ``knowledge_base.txt``.
-"""
-
+# bot.py
+import os
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import Response
 from pydantic import BaseModel
 
+from charset_normalizer import from_path
 from langchain_ollama import OllamaLLM
-from langchain_community.document_loaders import DirectoryLoader, TextLoader
+from langchain_community.document_loaders import DirectoryLoader
+from langchain_community.document_loaders.base import BaseLoader
+from langchain_core.documents import Document
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import FAISS
 from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain.chains import RetrievalQA
-from charset_normalizer import from_path
-import os
-# ----- FastAPI setup -----
-app = FastAPI()
 
-# Allow local frontend to call backend
+app = FastAPI(title="RAG Chat", version="0.1.0")
+
+# CORS: let the middleware handle preflight automatically
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # change to your domain in production
+    allow_origins=["*"],     # or restrict to your frontend origin(s)
+    allow_credentials=False, # keep False when using "*"
     allow_methods=["*"],
     allow_headers=["*"],
 )
-# ----- RAG bot setup -----
 
+SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
+DOCS_DIR = os.path.join(SCRIPT_DIR, "BotWeb")
+if not os.path.isdir(DOCS_DIR):
+    DOCS_DIR = SCRIPT_DIR
 
-def auto_loader(path: str) -> TextLoader:
-    """Detect file encoding and return a TextLoader using that encoding.
+class RobustTextLoader(BaseLoader):
+    """Load text using detected encoding and replace undecodable bytes."""
+    def __init__(self, path: str):
+        self.path = path
 
-    Some of the knowledge-base files include characters that are not decodable
-    with the default Windows CP1252 codec. ``charset_normalizer`` inspects each
-    file and suggests an encoding so that all text can be read safely.
-    """
+    def load(self):
+        result = from_path(self.path).best()
+        encoding = result.encoding if result else "utf-8"
+        with open(self.path, encoding=encoding, errors="replace") as f:
+            text = f.read()
+        return [Document(page_content=text, metadata={"source": self.path})]
 
-    result = from_path(path).best()
-    encoding = result.encoding if result else "utf-8"
-    return TextLoader(path, encoding=encoding, errors="replace")
-
-
-llm = OllamaLLM(model="llama3.1:latest")
-
-script_dir = os.path.dirname(os.path.realpath(__file__))
-# Load all ``.txt`` files in the repository directory, such as ``knowledge_base.txt``.
-docs_path = script_dir
+# Build RAG artifacts
 loader = DirectoryLoader(
-    docs_path,
+    DOCS_DIR,
     glob="**/*.txt",
-    loader_cls=auto_loader,
+    loader_cls=RobustTextLoader,
     show_progress=True,
 )
 docs = loader.load()
@@ -62,17 +58,28 @@ emb = HuggingFaceEmbeddings(
     model_kwargs={"trust_remote_code": True},
 )
 vs = FAISS.from_documents(chunks, emb)
+
+llm = OllamaLLM(model="llama3.1:latest")
 qa = RetrievalQA.from_chain_type(
     llm=llm,
     chain_type="stuff",
-    retriever=vs.as_retriever(search_kwargs={"k": 5})
+    retriever=vs.as_retriever(search_kwargs={"k": 5}),
 )
 
-# ----- API endpoint -----
 class Query(BaseModel):
     question: str
 
+@app.get("/health")
+def health():
+    return {"ok": True, "docs_dir": DOCS_DIR, "chunks": len(chunks)}
+
+# No need for a manual OPTIONS handler—CORS middleware handles it.
 @app.post("/chat")
 def chat(query: Query):
     answer = qa.run(query.question)
     return {"answer": answer}
+
+# IMPORTANT: run the in-memory app object, not "app:app"
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="127.0.0.1", port=8000, reload=True)
